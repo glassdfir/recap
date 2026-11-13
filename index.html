@@ -1627,7 +1627,7 @@ mark { background: rgba(242, 169, 59, 0.35); color: inherit; border-radius: 2px;
           row('0', 'Remove the tag'), row('n', 'Write a note'), row('z', 'Zoom to ±5 minutes around the selected event'),
           row('Shift+Z / r', 'Zoom out / reset the time window'), row('t', 'Tagged events only'), row('/', 'Filter'), row('Esc', 'Deselect')),
         el('h4', 'URL options'),
-        el('table', row('?sample=1', 'Open with the sample case'), row('?src=<url>', 'Load a file from a URL (repeatable; the host must allow CORS)'))),
+        el('table', row('?sample=1', 'Open with the sample case'), row('?src=<url>', 'Load a file from a URL (repeatable; the host must allow CORS)'), row('#input=<base64>', 'Load data carried in the link (gzip ok; optional &name=, &time=, &sum=, &tz=). It never reaches a server.'))),
       buttons: [{ label: 'Close', primary: true }],
     });
   }
@@ -1674,6 +1674,52 @@ mark { background: rgba(242, 169, 59, 0.35); color: inherit; border-radius: 2px;
     bindKeys();
   }
 
+  // Data carried in the link itself, like Spoke:
+  //   #input=<base64url CSV/TSV/JSON, gzip ok>&name=<file name>&time=<col>[,<col>]&sum=<col>[,<col>]&tz=<hours>
+  // The fragment never leaves the browser, so the data reaches no server.
+  function fragmentParams() {
+    const out = {};
+    const dec = (v) => { try { return decodeURIComponent(v); } catch (e) { return v; } };
+    for (const part of location.hash.replace(/^#/, '').split('&')) {
+      if (!part) continue;
+      const i = part.indexOf('=');
+      out[dec(i < 0 ? part : part.slice(0, i))] = i < 0 ? '' : dec(part.slice(i + 1));
+    }
+    return out;
+  }
+
+  async function fragmentText(b64) {
+    let s = b64.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    s += '='.repeat((4 - (s.length % 4)) % 4);
+    let bytes = Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+      bytes = new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+    }
+    return new TextDecoder().decode(bytes);
+  }
+
+  async function loadFragment(frag) {
+    const list = (v) => (v || '').split(',').map((x) => x.trim()).filter(Boolean);
+    try {
+      const name = frag.name || 'linked-data.csv';
+      const data = P.parseText(name, await fragmentText(frag.input));
+      const opts = {};
+      if (list(frag.time).length) opts.timeCols = list(frag.time);
+      const sum = list(frag.sum).map((h) => data.headers.indexOf(h)).filter((i) => i >= 0);
+      if (sum.length) opts.sumCols = sum;
+      if (frag.tz) opts.tz = +frag.tz || 0;
+      const src = addSource(name, data, opts);
+      if (src) { rebuildEvents(); U.toast('Loaded ' + src.events.length.toLocaleString() + ' events from the link'); }
+      return Boolean(src);
+    } catch (e) {
+      U.toast("Couldn't read the data in that link: " + e.message, true);
+      return false;
+    } finally {
+      // Don't leave the data in the address bar, history or a bookmark.
+      history.replaceState(null, '', location.pathname + location.search);
+    }
+  }
+
   async function boot() {
     const params = new URLSearchParams(location.search);
     const theme = params.get('theme') || U.store.get('mill.theme', null) || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
@@ -1682,8 +1728,10 @@ mark { background: rgba(242, 169, 59, 0.35); color: inherit; border-radius: 2px;
     // A link that brings its own data (?src=) opens a fresh case, like ?sample=,
     // instead of adding to the saved one (which would pile up a copy per visit)
     const urls = params.getAll('src');
+    const frag = fragmentParams();
+    const linked = 'input' in frag;
     if (params.get('sample')) loadSample();
-    else if (!urls.length) {
+    else if (!urls.length && !linked) {
       const saved = await DB.get('case');
       if (saved && saved.sources && saved.sources.length) { try { await loadCase(saved); } catch (e) { /* ignore a bad save */ } }
     }
@@ -1708,8 +1756,9 @@ mark { background: rgba(242, 169, 59, 0.35); color: inherit; border-radius: 2px;
       } catch (e) { U.toast('Could not load ' + u + ': ' + e.message, true); }
     }
     if (urls.length) rebuildEvents();
+    if (linked) await loadFragment(frag);
     $('zone').value = S.zone;
-    refresh(urls.length > 0);
+    refresh(urls.length > 0 || linked);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();
